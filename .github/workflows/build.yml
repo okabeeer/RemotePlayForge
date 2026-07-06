@@ -1,0 +1,76 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed for the release job to upload assets
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build (in-box .NET Framework csc — no SDK needed)
+        shell: pwsh
+        run: .\build.ps1
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: RemotePlayForge
+          path: |
+            bin/RemotePlayForge.exe
+            bin/RPForgeSession.exe
+          if-no-files-found: error
+
+  release:
+    # Only when a version tag (v1.0.0, ...) is pushed. Publishes a zip on the GitHub Release.
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        shell: pwsh
+        run: .\build.ps1
+
+      - name: Package release zip
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $staging = "RemotePlayForge-$tag"
+          New-Item -ItemType Directory -Force $staging | Out-Null
+          Copy-Item bin/RemotePlayForge.exe, bin/RPForgeSession.exe, README.md, LICENSE $staging
+          Compress-Archive -Path "$staging/*" -DestinationPath "$staging.zip" -Force
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          @"
+          ## RemotePlayForge $tag
+
+          **How to use — no install, no building:**
+          1. Download **RemotePlayForge-$tag.zip** below and extract it.
+          2. Keep **RemotePlayForge.exe** and **RPForgeSession.exe** together in the same folder.
+          3. Make sure Steam is running and signed in, and launch your game through Steam.
+          4. Double-click **RemotePlayForge.exe**, then invite a friend or generate a guest link.
+
+          Windows may show a blue "Windows protected your PC" screen because the app is unsigned —
+          click **More info**, then **Run anyway**.
+
+          Requires Windows 10/11 (x64). .NET Framework 4.x is built into Windows, so there is nothing to install.
+          "@ | Set-Content notes.md -Encoding utf8
+          gh release create $tag "RemotePlayForge-$tag.zip" --title $tag --notes-file notes.md

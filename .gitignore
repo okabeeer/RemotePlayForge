@@ -1,0 +1,17 @@
+# Build output
+bin/
+obj/
+
+# Runtime config generated next to the exe
+hotkeys.cfg
+
+# Valve redistributables — never commit these
+steam_api64.dll
+steamclient64.dll
+
+# Editor / OS
+.vs/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini

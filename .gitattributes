@@ -1,0 +1,6 @@
+# Normalize line endings: LF in the repo, native in each working copy.
+* text=auto
+
+# Windows-oriented scripts/sources keep CRLF locally.
+*.ps1 text eol=crlf
+*.cs  text eol=crlf
