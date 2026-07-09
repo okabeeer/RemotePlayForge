@@ -25,8 +25,8 @@ using System.Threading;
 internal static class RPForgeSession
 {
     const int RPT_INVITE_RESULT = 1100028;
+    const int k_EFriendFlagImmediate = 0x04;
     const int k_EChatEntryTypeChatMsg = 1;
-    const ulong STEAMID_INDIVIDUAL_BASE = 76561197960265728UL;
 
     [DllImport("kernel32", CharSet = CharSet.Ansi, SetLastError = true)] static extern IntPtr LoadLibrary(string p);
     [DllImport("kernel32", CharSet = CharSet.Ansi, SetLastError = true, ExactSpelling = true)] static extern IntPtr GetProcAddress(IntPtr h, string n);
@@ -39,8 +39,13 @@ internal static class RPForgeSession
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate uint D_U(IntPtr s);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate uint D_Uu(IntPtr s, uint a);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void D_VoidU(IntPtr s, uint a);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void D_VoidB(IntPtr s, [MarshalAs(UnmanagedType.I1)] bool a);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void D_Void(IntPtr s);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void D_SetInputP(IntPtr s, IntPtr player, [MarshalAs(UnmanagedType.I1)] bool enabled);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] [return: MarshalAs(UnmanagedType.I1)] delegate bool D_Bool(IntPtr s);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int D_CountFlags(IntPtr s, int flags);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void D_ByIndex(IntPtr s, IntPtr ret, int i, int flags);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int D_StateOfId(IntPtr s, ulong id);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate IntPtr D_NameOfId(IntPtr s, ulong id);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] [return: MarshalAs(UnmanagedType.I1)] delegate bool D_CreateInvite(IntPtr s, IntPtr player, uint appId);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] [return: MarshalAs(UnmanagedType.I1)] delegate bool D_SendMsg(IntPtr s, ulong id, int type, [MarshalAs(UnmanagedType.LPStr)] string body);
@@ -76,38 +81,82 @@ internal static class RPForgeSession
 
     static uint ReadGroup() { int i = R("GetLocalRemotePlayTogetherGroupID"); if (i < 0) return 0; try { return V<D_U>(_rcm, i)(_rcm); } catch { return 0; } }
 
+    // Locate the Steam install from the registry so we work no matter which drive Steam is on
+    // (e.g. D:\Steam). Falls back to the default only if the registry has nothing usable.
+    static string SteamDir()
+    {
+        try
+        {
+            object v = Microsoft.Win32.Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam", "SteamPath", null);
+            if (v != null) { string s = ((string)v).Replace('/', '\\'); if (Directory.Exists(s)) return s; }
+        }
+        catch { }
+        try
+        {
+            object v = Microsoft.Win32.Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath", null);
+            if (v != null) { string s = (string)v; if (Directory.Exists(s)) return s; }
+        }
+        catch { }
+        return @"C:\Program Files (x86)\Steam";
+    }
+
     // NOTE: Main is intentionally MTA (no [STAThread]). Steam's async RPT group creation does not
-    // complete when the calling thread is STA (STA => group stays 0, MTA => group allocates).
+    // complete when the calling thread is STA — verified: STA => group stays 0, MTA => group allocates.
     static int Main(string[] args)
     {
-        string dir = @"C:\Program Files (x86)\Steam";
+        string dir = SteamDir();
+        string dll = Path.Combine(dir, "steamclient64.dll");
+        if (!File.Exists(dll)) { Console.WriteLine("steamclient64.dll not found at " + dll + " — could not locate your Steam install."); Hold(); return 3; }
+        // cwd must be the Steam dir so steamclient64.dll's own dependencies (tier0_s64.dll, etc.) resolve.
         Directory.SetCurrentDirectory(dir);
-        _h = LoadLibrary(Path.Combine(dir, "steamclient64.dll"));
+        _h = LoadLibrary(dll);
+        if (_h == IntPtr.Zero) { Console.WriteLine("Could not load steamclient64.dll from " + dir + " (err " + Marshal.GetLastWin32Error() + ")."); Hold(); return 3; }
         var CI = (D_CI)Marshal.GetDelegateForFunctionPointer(GetProcAddress(_h, "CreateInterface"), typeof(D_CI));
         IntPtr cl = CI("SteamClient019", IntPtr.Zero);
         _pipe = V<D_I>(cl, 0)(cl);
-        _user = V<D_Ii>(cl, 2)(cl, _pipe);
+        int user = V<D_Ii>(cl, 2)(cl, _pipe); _user = user;
         IntPtr eng = CI("CLIENTENGINE_INTERFACE_VERSION005", IntPtr.Zero); _eng = eng;
         _rcm = V<D_PtrInt>(eng, 56)(eng, _pipe);
-        // Do NOT acquire IClientFriends yet: obtaining the friends interface before creating the RPT
-        // group makes BCreateRemotePlayGroup allocate nothing. We acquire it later, after the group exists.
+        // IMPORTANT: do NOT acquire IClientFriends yet. Verified live that obtaining the friends
+        // interface before creating the RPT group makes BCreateRemotePlayGroup allocate nothing
+        // (group stays 0). We acquire friends LATER, only to send the URL, after the group exists.
         if (_rcm == IntPtr.Zero) { Console.WriteLine("RCM null — is Steam running & signed in?"); Hold(); return 2; }
         _bget = (D_BGet)Marshal.GetDelegateForFunctionPointer(GetProcAddress(_h, "Steam_BGetCallback"), typeof(D_BGet));
         _bfree = (D_Free)Marshal.GetDelegateForFunctionPointer(GetProcAddress(_h, "Steam_FreeLastCallback"), typeof(D_Free));
         _rmap = ScanNames(_rcm);
+        DumpMethods("IClientRemoteClientManager", _rmap);
 
-        // AppID: prefer an explicit arg (the GUI passes its resolved AppID); else read the registry.
+        // AppID: prefer an explicit arg2 (the GUI passes its resolved AppID); else read the registry.
         uint appId = 0;
         if (args.Length > 1) uint.TryParse(args[1], out appId);
         if (appId == 0) { try { object v = Microsoft.Win32.Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam", "RunningAppID", 0); if (v != null) appId = Convert.ToUInt32(v); } catch { } }
+        Console.WriteLine("AppID = " + appId);
         _appId = appId;
-        // Our own SteamID64 = individual base + logged-in account id (registry). Used to exclude the
-        // host when scanning callbacks for guest SteamIDs (both carry the 0x01100001 signature).
-        try { object av = Microsoft.Win32.Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam\ActiveProcess", "ActiveUser", 0); if (av != null) { uint acct = Convert.ToUInt32(av); if (acct != 0) _hostSteam = STEAMID_INDIVIDUAL_BASE + acct; } } catch { }
+        // Our own SteamID64 = individual base + the logged-in account id (from the registry). Used to
+        // exclude the host when scanning callbacks for guest SteamIDs (both have the 0x01100001 signature).
+        try { object av = Microsoft.Win32.Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam\ActiveProcess", "ActiveUser", 0); if (av != null) { uint acct = Convert.ToUInt32(av); if (acct != 0) _hostSteam = 76561197960265728UL + acct; } } catch { }
         if (appId == 0) { Console.WriteLine("No game running under Steam. Launch your game first, then rerun."); Hold(); return 4; }
 
-        // Target: a friend SteamID64 (direct invite) OR "LINK"/0 for a shareable guest link that anyone
-        // with Steam can join (the guest slot has no specific SteamID).
+        // If Steam isn't tracking this AppID as its running game, the game was launched OUTSIDE Steam —
+        // e.g. EA FC 26 through the EA App. Steam then has no game window hooked to capture, so enable
+        // DESKTOP streaming (share the whole screen), which works regardless of how the game launched.
+        // For a normally-launched Steam game the ids match and we leave the default game-window capture.
+        uint steamTracked = 0;
+        try { object rv = Microsoft.Win32.Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam", "RunningAppID", 0); if (rv != null) steamTracked = Convert.ToUInt32(rv); } catch { }
+        if (appId != steamTracked)
+        {
+            int iDesk = R("SetStreamingDesktopToRemotePlayTogetherEnabled");
+            if (iDesk >= 0)
+            {
+                try { V<D_VoidB>(_rcm, iDesk)(_rcm, true); Console.WriteLine("Enabled desktop streaming (AppID " + appId + " launched outside Steam)."); }
+                catch (Exception e) { Console.WriteLine("  desktop-stream enable threw " + e.GetType().Name); }
+            }
+            else if (_diag) Console.WriteLine("DIAG SetStreamingDesktopToRemotePlayTogetherEnabled not found in RCM.");
+        }
+
+        // resolve target: a friend SteamID64 (direct invite) OR "LINK"/0 for a shareable guest link
+        // that anyone with Steam can join — no friendship required (guest slot has no specific
+        // SteamID). Friend name is looked up later once the friends interface is acquired.
         bool linkMode = false;
         ulong target = 0;
         if (args.Length > 0)
@@ -118,41 +167,62 @@ internal static class RPForgeSession
         else linkMode = true;
         if (!linkMode && target == 0) linkMode = true;
         _target = target; // 0 in link mode
+        Console.WriteLine(linkMode ? "Mode: GUEST LINK (shareable — no specific friend)"
+                                   : ("Inviting friend: [" + target + "]"));
 
-        // ---- create the host Remote Play Together group ----
+        // ---- group creation: mirror GroupProbe EXACTLY (it works reliably) ----
+        Console.WriteLine("idx: Show=" + R("ShowRemotePlayTogetherUI") + " Create=" + R("BCreateRemotePlayGroup")
+            + " LocalGroup=" + R("GetLocalRemotePlayTogetherGroupID") + " Guest=" + R("GetAvailableRemotePlayTogetherGuestID"));
+
         int iShow0 = R("ShowRemotePlayTogetherUI");
         if (iShow0 >= 0)
         {
-            try { V<D_VoidU>(_rcm, iShow0)(_rcm, appId); } catch { }
-            // Reading the group id while it settles is what makes Steam bind it.
-            for (int t = 1; t <= 5; t++) { Pump(500); ReadGroup(); }
+            Console.WriteLine("calling ShowRemotePlayTogetherUI(" + appId + ") ...");
+            try { V<D_VoidU>(_rcm, iShow0)(_rcm, appId); } catch (Exception e) { Console.WriteLine("  threw " + e.GetType().Name); }
+            for (int t = 1; t <= 5; t++) { Pump(500); Console.WriteLine("group +" + (t * 500) + "ms after ShowUI = " + ReadGroup()); }
         }
 
         int iCreate = R("BCreateRemotePlayGroup");
-        try { V<D_U>(_rcm, iCreate)(_rcm); } catch { }
+        uint ret = 0; try { ret = V<D_U>(_rcm, iCreate)(_rcm); } catch (Exception e) { Console.WriteLine("BCreate threw " + e.GetType().Name); }
+        Console.WriteLine("BCreateRemotePlayGroup returned = " + ret + " (0x" + ret.ToString("X") + ")");
         uint group = 0; var sw = Stopwatch.StartNew();
         while (sw.ElapsedMilliseconds < 4000) { Pump(150); group = ReadGroup(); if (group != 0) break; }
+        Console.WriteLine("group AFTER polling = " + group + " (took " + sw.ElapsedMilliseconds + "ms)");
         if (group == 0) { Console.WriteLine("Could not create a host group — aborting."); Hold(); return 5; }
 
-        // Create the first invite/session into the group, pump for the join URL, deliver it. The same
-        // logic runs for each extra friend/link added to the LIVE session (see the ADD command).
+        // 2-5) create the first invite/session into the group, pump for the join URL, deliver it.
+        // The SAME logic runs later for each extra friend/link added to the LIVE session (see ADD).
         AddGuest(target, linkMode);
 
-        // Open the host overlay for this session.
+        // 6) open the host overlay for this session
         int iShow = R("ShowRemotePlayTogetherUI");
-        if (iShow >= 0) { try { V<D_VoidU>(_rcm, iShow)(_rcm, appId); } catch { } }
+        if (iShow >= 0) { try { V<D_VoidU>(_rcm, iShow)(_rcm, appId); Console.WriteLine("Opened Remote Play Together overlay."); } catch { } }
+
+        Console.WriteLine("\n================================================================");
+        Console.WriteLine(" SESSION LIVE. Keep THIS window open until your friend joins.");
+        Console.WriteLine(" Alt-Tab into your GAME: your friend should appear in the RPT");
+        Console.WriteLine(" player list with controller/keyboard/mouse icons to grant control.");
+        Console.WriteLine(" Press Ctrl+C or close this window to end the session.");
+        Console.WriteLine("================================================================");
 
         int iUpdateAll = R("UpdateRemotePlayTogetherGroups");
         int iUpdateOne = R("UpdateRemotePlayTogetherGroup");
-        _iKbd = R("SetPerUserKeyboardInputEnabled");
-        _iMouse = R("SetPerUserMouseInputEnabled");
-        _iCtrl = R("SetPerUserControllerInputEnabled");
+        int iKbd = R("SetPerUserKeyboardInputEnabled");
+        int iMouse = R("SetPerUserMouseInputEnabled");
+        int iCtrl = R("SetPerUserControllerInputEnabled");
+        Console.WriteLine("idx: UpdateGroups=" + iUpdateAll + " UpdateGroup=" + iUpdateOne
+            + " Kbd=" + iKbd + " Mouse=" + iMouse + " Ctrl=" + iCtrl);
 
-        // Listen for live commands from the GUI on stdin.
+        // Expose the input-method indices to the stdin command thread + heartbeat, then start
+        // listening for live toggle commands from the GUI.
+        _iKbd = iKbd; _iMouse = iMouse; _iCtrl = iCtrl;
         Thread cmdThread = new Thread(CommandLoop); cmdThread.IsBackground = true; cmdThread.Start();
+        Console.WriteLine("READY — live input toggles active (KBD/MOUSE/CTRL 0|1, ALL 0|1).");
 
-        // Stay alive: pump callbacks, publish group membership so connected guests register as players,
-        // discover guests, add queued guests, and re-assert the desired control state on a heartbeat.
+        // 7) stay alive, pumping callbacks. When the guest connects, PUBLISH the group so their
+        // streaming session is registered as a player in the overlay list (UpdateRemotePlayTogetherGroups)
+        // and refresh the overlay UI. We also do this periodically as a heartbeat.
+        var seen = new Dictionary<int, int>();
         IntPtr m2 = Marshal.AllocHGlobal(64);
         var pub = Stopwatch.StartNew();
         while (true)
@@ -162,26 +232,42 @@ internal static class RPForgeSession
             {
                 any = true;
                 int cb = Marshal.ReadInt32(m2, 4);
+                int c; seen.TryGetValue(cb, out c); seen[cb] = c + 1;
                 if (cb >= 1100000 && cb < 1100100 && cb != RPT_INVITE_RESULT)
                 {
-                    // 1100042 = active streaming heartbeat -> a guest is really connected now.
+                    Console.WriteLine("  [callback " + cb + "] (group id now = " + ReadGroup() + ")");
+                    // 1100042 = active streaming heartbeat -> the guest is really connected now.
                     if (cb == 1100042 && !_guestConnected) { _guestConnected = true; Console.WriteLine("GUEST CONNECTED"); }
-                    IntPtr param = Marshal.ReadIntPtr(m2, 8);
-                    if (param != IntPtr.Zero) DiscoverPlayers(param);
+                    // Discover connected guests: read any guest SteamIDs out of this callback's payload
+                    // (read-only, cannot crash Steam) and add each as a player. This is how both link
+                    // control AND the multi-guest roster work — each distinct guest becomes a row.
+                    {
+                        IntPtr param = Marshal.ReadIntPtr(m2, 8);
+                        if (param != IntPtr.Zero) DiscoverPlayers(param);
+                    }
+                    // guest-connect-ish events: publish group membership (+ refresh overlay once)
                     if (cb == 1100026 || cb == 1100017 || cb == 1100033 || cb == 1100058 || cb == 1100032)
-                        PublishGroup(iUpdateAll, iUpdateOne, appId, !_refreshedOnce);
+                        PublishGroup(iUpdateAll, iUpdateOne, appId, !_refreshedOnce, "on cb " + cb);
                 }
                 if (_bfree != null) _bfree(_pipe);
             }
-            // Add another guest to the LIVE session if the GUI queued one (on THIS thread, so the
+            // Add another guest to the LIVE session if the GUI queued one (runs on THIS thread so the
             // callback pipe has a single reader). Existing guests stay connected.
             AddReq pending = null;
             lock (_addQueue) { if (_addQueue.Count > 0) pending = _addQueue.Dequeue(); }
             if (pending != null) AddGuest(pending.Target, pending.Link);
             if (pub.ElapsedMilliseconds > 2000)
             {
-                PublishGroup(iUpdateAll, iUpdateOne, appId, false);
-                if (_guestConnected) ApplyControl();
+                PublishGroup(iUpdateAll, iUpdateOne, appId, false, "heartbeat");
+                if (_guestConnected)
+                {
+                    // The link-guest's SteamID is resolved from the connect callback payload (see the
+                    // callback loop) — a read-only scan, never a speculative Steam call. Just re-assert
+                    // control here; _target is filled once a callback carrying the SteamID arrives.
+                    int pc; lock (_players) pc = _players.Count;
+                    if (pc == 0 && !_emptyWarned) { _emptyWarned = true; if (_diag) Console.WriteLine("DIAG guest connected but NO SteamID found in any callback payload yet — cannot target control."); }
+                    ApplyControl("heartbeat");
+                }
                 pub.Restart();
             }
             if (!any) Thread.Sleep(200);
@@ -190,10 +276,10 @@ internal static class RPForgeSession
 
     static bool _refreshedOnce = false;
 
-    // Publish group membership so a connected guest's streaming session shows as a player in the overlay
-    // list. UpdateRemotePlayTogetherGroups is no-arg; the singular variant takes the group id. Only
-    // re-open the overlay once, to avoid spamming it open.
-    static void PublishGroup(int iUpdateAll, int iUpdateOne, uint appId, bool showUi)
+    // Publish group membership (so a connected guest's streaming session becomes a player in the
+    // overlay list). UpdateRemotePlayTogetherGroups is no-arg; the singular variant takes the group id.
+    // Only re-open the overlay (showUi) once, to avoid spamming it open.
+    static void PublishGroup(int iUpdateAll, int iUpdateOne, uint appId, bool showUi, string why)
     {
         try
         {
@@ -205,16 +291,17 @@ internal static class RPForgeSession
                 if (iShow >= 0) V<D_VoidU>(_rcm, iShow)(_rcm, appId);
                 _refreshedOnce = true;
             }
+            Console.WriteLine("  -> published group" + (showUi ? " + refreshed overlay" : "") + " (" + why + ")");
         }
-        catch { }
+        catch (Exception e) { Console.WriteLine("  -> PublishGroup threw " + e.GetType().Name + " (" + why + ")"); }
     }
 
     static bool _guestConnected = false;
+    static bool _emptyWarned = false;   // one-shot: warned that a guest connected but no SteamID resolved
     static bool _grantLogged = false;
     static IntPtr _grantBuf = IntPtr.Zero;
-
-    // One connected guest. Discovered by reading its SteamID + guest id out of connect callbacks
-    // (read-only). Each keeps its own desired input state so control can be flipped per person.
+    // One connected guest. Discovered by reading SteamIDs out of connect callbacks (read-only).
+    // Each keeps its own desired input state so control can be flipped per person.
     sealed class GPlayer { public ulong Steam; public uint Guest; public string Name; public bool Kbd = true, Mouse = true, Ctrl = true; }
     static readonly List<GPlayer> _players = new List<GPlayer>();
     static ulong _hostSteam = 0;   // our own SteamID — excluded so we never toggle the host's input
@@ -223,12 +310,14 @@ internal static class RPForgeSession
     // pump thread so only one thread ever reads the Steam callback pipe (concurrent readers are unsafe).
     sealed class AddReq { public ulong Target; public bool Link; }
     static readonly Queue<AddReq> _addQueue = new Queue<AddReq>();
+    static readonly HashSet<ulong> _diagSeen = new HashSet<ulong>();   // dedupe candidate DIAG logging
+    static readonly HashSet<string> _grpDiagSeen = new HashSet<string>();   // dedupe group-anchored slot DIAG
+    static uint _maxInvitedGuest;   // highest guest id we actually created an invite for (bounds anonymous-guest acceptance)
+    static readonly bool _diag = Environment.GetEnvironmentVariable("RPFORGE_DIAG") == "1";   // verbose DIAG logging (off for release)
 
-    // Read live commands from stdin (sent by the GUI) and apply them immediately.
-    //   Global: KBD|MOUSE|CTRL|ALL 0|1        (also accepts ON/OFF and full words)
-    //   Per player: PKBD|PMOUSE|PCTRL|PALL <slot> 0|1
-    //   ADD <friendSteamID64|LINK>            add another guest to the live session
-    //   STOP                                  disconnect everyone and end the session
+    // Read live toggle commands from stdin (sent by the GUI) and apply them immediately.
+    // Protocol (case-insensitive, one per line):
+    //   KBD 0|1 | MOUSE 0|1 | CTRL 0|1 | ALL 0|1   (also accepts ON/OFF and full words)
     static void CommandLoop()
     {
         try
@@ -242,6 +331,7 @@ internal static class RPForgeSession
                 if (p.Length == 0) continue;
                 if (p[0] == "STOP" || p[0] == "QUIT" || p[0] == "END" || p[0] == "KICK" || p[0] == "EXIT")
                 {
+                    Console.WriteLine("STOPPING — disconnecting the guest and ending the session.");
                     Teardown();
                     Environment.Exit(0);
                 }
@@ -253,6 +343,7 @@ internal static class RPForgeSession
                     if (p[1] == "LINK" || p[1] == "0" || !ulong.TryParse(p[1], out req.Target)) req.Link = true;
                     if (!req.Link && req.Target == 0) req.Link = true;
                     lock (_addQueue) _addQueue.Enqueue(req);
+                    Console.WriteLine("queued ADD " + (req.Link ? "LINK" : req.Target.ToString()));
                     continue;
                 }
                 // Per-player commands from the roster rows: P<field> <slot> <0|1>.
@@ -268,7 +359,7 @@ internal static class RPForgeSession
                     else if (p[0] == "PCTRL") gp.Ctrl = pon;
                     else { gp.Kbd = pon; gp.Mouse = pon; gp.Ctrl = pon; }
                     EmitPlayer(slot);
-                    ApplyControl();
+                    ApplyControl("player " + slot);
                     continue;
                 }
 
@@ -300,18 +391,20 @@ internal static class RPForgeSession
                 }
                 Console.WriteLine("INPUT KBD=" + (_wantKbd ? 1 : 0) + " MOUSE=" + (_wantMouse ? 1 : 0) + " CTRL=" + (_wantCtrl ? 1 : 0));
                 for (int si = 1; si <= _players.Count; si++) EmitPlayer(si);
-                ApplyControl();
+                ApplyControl("stdin");
             }
         }
         catch { }
     }
 
-    // Enable/disable keyboard/mouse/controller for each connected guest to match its desired state
-    // (the same thing clicking the overlay control icons does). These methods take a RemotePlayPlayer_t*
-    // (40-byte struct), NOT (group,guest) ints. Called on the heartbeat and on live toggles.
     [System.Runtime.ExceptionServices.HandleProcessCorruptedStateExceptions]
     [System.Security.SecurityCritical]
-    static void ApplyControl()
+    // Enable/disable keyboard/mouse/controller input for the connected guest to match the desired
+    // (_wantKbd/_wantMouse/_wantCtrl) state — the same thing clicking the overlay control icons does.
+    // These methods take a RemotePlayPlayer_t* (the same 40-byte struct as the invite), NOT
+    // (group,guest) ints. Steam identified the guest as "guest1"; we cover guest ids 1..2 to be safe.
+    // Called both on the heartbeat (to re-assert state) and from the stdin thread (on a live toggle).
+    static void ApplyControl(string why)
     {
         uint g = ReadGroup();
         if (g == 0) return;
@@ -323,27 +416,30 @@ internal static class RPForgeSession
                 GPlayer[] arr; lock (_players) { arr = _players.ToArray(); }
                 if (arr.Length == 0)
                 {
-                    // No guest resolved yet — single-target fallback (guest ids 1..2), global want state.
+                    // No guest resolved yet — legacy single-target sweep (guest ids 1..2), global want state.
                     for (uint guest = 1; guest <= 2; guest++)
                         SetInputsFor(_target, guest, g, _wantKbd, _wantMouse, _wantCtrl);
                 }
                 else
                 {
-                    // Per player: write to that guest's OWN id — the TRUE id read from Steam's callback
-                    // (p.Guest), or join-order as a fallback. Never sweep all ids: with 2+ guests that
-                    // cross-writes each other's slots, so revoking one person gets undone by the next.
+                    // Per player: write to that guest's OWN id. Prefer the TRUE id read from Steam's
+                    // callback (p.Guest); fall back to join-order only if we haven't seen it yet. Never
+                    // sweep all ids — with 2+ guests that cross-writes each other's slots so revoking one
+                    // person's input gets undone by the next player's write.
                     int n = arr.Length;
                     for (int i = 0; i < n; i++)
                     {
                         GPlayer p = arr[i];
-                        if (p.Steam == 0) continue;
+                        // p.Steam == 0 is a valid no-account Steam Link guest (identified by guest id),
+                        // so don't skip it — Steam applies per-user input by the {steam, guest, group}
+                        // slot and steam=0 is exactly what the working link path already used.
                         uint gid = p.Guest != 0 ? p.Guest : (uint)(i + 1);
                         SetInputsFor(p.Steam, gid, g, p.Kbd, p.Mouse, p.Ctrl);
                     }
                 }
-                if (!_grantLogged) { Console.WriteLine("granted keyboard/mouse/controller input"); _grantLogged = true; }
+                if (!_grantLogged) { Console.WriteLine("  -> granted keyboard/mouse/controller input (group " + g + ", players " + arr.Length + ")"); _grantLogged = true; }
             }
-            catch { }
+            catch (Exception e) { if (!_grantLogged) { Console.WriteLine("  -> ApplyControl threw " + e.GetType().Name); _grantLogged = true; } }
         }
     }
 
@@ -361,6 +457,25 @@ internal static class RPForgeSession
         if (_iCtrl >= 0) V<D_SetInputP>(_rcm, _iCtrl)(_rcm, _grantBuf, c);
     }
 
+    // Write the full vtable name->index map to rpforge_methods.txt next to the exe, so the exact
+    // Steam method names for THIS build can be read afterwards and wired precisely if a heuristic misses.
+    static void DumpMethods(string label, Dictionary<string, int> map)
+    {
+        try
+        {
+            string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "rpforge_methods.txt");
+            var list = new List<KeyValuePair<string, int>>(map);
+            list.Sort(delegate(KeyValuePair<string, int> a, KeyValuePair<string, int> b) { return a.Value.CompareTo(b.Value); });
+            var sb = new StringBuilder();
+            sb.AppendLine("==== " + label + "  (" + map.Count + " methods)  " + DateTime.Now + " ====");
+            foreach (KeyValuePair<string, int> kv in list) sb.AppendLine(kv.Value + "\t" + kv.Key);
+            sb.AppendLine();
+            File.AppendAllText(path, sb.ToString());
+            Console.WriteLine("(dumped " + map.Count + " " + label + " methods to rpforge_methods.txt)");
+        }
+        catch (Exception e) { Console.WriteLine("(method dump failed: " + e.GetType().Name + ")"); }
+    }
+
     // Lowest-index vtable slot whose name contains ALL of mustAll and NONE of mustNone (case-insensitive).
     static int FindEntry(Dictionary<string, int> map, string[] mustAll, string[] mustNone, out string name)
     {
@@ -375,20 +490,21 @@ internal static class RPForgeSession
         return best;
     }
 
-    // Fully end the session so guests STOP watching: disable all input, then disband the RPT group.
-    // Killing the process alone leaves Steam's stream alive, so a guest would keep watching.
+    // Fully end the session so the guest STOPS watching: disable all input, then DESTROY the RPT group.
+    // Killing the process alone leaves Steam's stream alive, so the guest keeps watching — this fixes that.
     [System.Runtime.ExceptionServices.HandleProcessCorruptedStateExceptions]
     [System.Security.SecurityCritical]
     static void Teardown()
     {
-        try { _wantKbd = _wantMouse = _wantCtrl = false; lock (_players) { foreach (GPlayer gp in _players) gp.Kbd = gp.Mouse = gp.Ctrl = false; } ApplyControl(); } catch { }
+        try { _wantKbd = _wantMouse = _wantCtrl = false; lock (_players) { foreach (GPlayer gp in _players) { gp.Kbd = gp.Mouse = gp.Ctrl = false; } } ApplyControl("teardown"); } catch { }
         try
         {
             uint g = ReadGroup();
-            // DisbandRemotePlayTogetherGroup(group) disconnects the guests. Fall back to a verb scan if
-            // a future build renames it.
-            string nm; int idx = R("DisbandRemotePlayTogetherGroup");
-            if (idx < 0 && (_rmap == null || !_rmap.TryGetValue("DestroyRemotePlayGroup", out idx))) idx = -1;
+            // On this build the group-kill method is DisbandRemotePlayTogetherGroup(group) — disbanding
+            // the group disconnects the guest so they stop watching entirely. Fall back to a verb scan
+            // (now incl. "Disband") if a future build renames it.
+            string nm = "DisbandRemotePlayTogetherGroup"; int idx = R("DisbandRemotePlayTogetherGroup");
+            if (idx < 0 && _rmap != null && _rmap.TryGetValue("DestroyRemotePlayGroup", out idx)) nm = "DestroyRemotePlayGroup";
             if (idx < 0)
             {
                 string[] verbs = { "Disband", "Destroy", "Leave", "Disconnect", "Remove", "Close", "End", "Kick", "Cancel" };
@@ -401,18 +517,23 @@ internal static class RPForgeSession
             }
             if (idx >= 0)
             {
-                try { if (g != 0) { V<D_VoidU>(_rcm, idx)(_rcm, g); return; } } catch { }
-                try { V<D_Void>(_rcm, idx)(_rcm); } catch { }
+                Console.WriteLine("teardown: calling " + nm + "(idx " + idx + ", group=" + g + ")");
+                bool done = false;
+                try { if (g != 0) { V<D_VoidU>(_rcm, idx)(_rcm, g); done = true; } } catch (Exception e) { Console.WriteLine("  D_VoidU threw " + e.GetType().Name); }
+                if (!done) { try { V<D_Void>(_rcm, idx)(_rcm); } catch (Exception e) { Console.WriteLine("  D_Void threw " + e.GetType().Name); } }
             }
+            else Console.WriteLine("teardown: no disband/destroy method matched (see rpforge_methods.txt to wire it precisely).");
         }
-        catch { }
+        catch (Exception e) { Console.WriteLine("teardown threw " + e.GetType().Name); }
     }
 
     // Read guests out of a Steam callback payload — pure read-only, never calls into steamclient64.dll
-    // with guessed args. A connect callback carries a RemotePlayPlayer_t {SteamID@0, guestId@8, groupId@12}.
-    // An individual SteamID64 has a fixed high dword ((id>>32)==0x01100001), so we locate the SteamID and
-    // read the adjacent guestId+groupId. If groupId matches our LIVE group it's a real RemotePlayPlayer_t
-    // and guestId is the guest's true id (what SetPerUser* needs). Excludes the host's own SteamID.
+    // with guessed args (that crashed Steam). A connect callback carries a RemotePlayPlayer_t
+    // {SteamID@0, guestId@8, groupId@12}. An individual SteamID64 has a fixed high dword
+    // (universe=public/type=individual/instance=1 => (id>>32)==0x01100001), so we locate the SteamID,
+    // then read the adjacent guestId+groupId. If groupId matches our LIVE group, this is a real
+    // RemotePlayPlayer_t and guestId is the guest's TRUE id (what SetPerUser* needs) — no more guessing.
+    // Excludes the host's own SteamID. Wrapped so an over-read past the struct's end can't crash us.
     [System.Runtime.ExceptionServices.HandleProcessCorruptedStateExceptions]
     [System.Security.SecurityCritical]
     static void DiscoverPlayers(IntPtr param)
@@ -420,38 +541,97 @@ internal static class RPForgeSession
         uint curGroup = ReadGroup();
         try
         {
+            // Widened to 512 bytes: link guests weren't being found in the first 256. Reads are guarded
+            // (break on failure) and the method is CSE-protected, so an over-read can't crash us.
             for (int off = 0; off + 16 <= 512; off += 4)
             {
                 ulong v;
                 try { v = (ulong)Marshal.ReadInt64(param, off); } catch { break; }
-                if ((v >> 32) != 0x01100001UL || (uint)v == 0) continue;
 
+                // Adjacent guestId/groupId — trust guestId only when the group matches our live group.
                 uint guestCand = 0, grpCand = 0;
                 try { guestCand = (uint)Marshal.ReadInt32(param, off + 8); grpCand = (uint)Marshal.ReadInt32(param, off + 12); } catch { }
                 bool structShape = (curGroup != 0 && grpCand == curGroup && guestCand >= 1 && guestCand <= 64);
 
-                if (v == _hostSteam || v <= STEAMID_INDIVIDUAL_BASE) continue;
+                // A standard desktop Steam account has high dword 0x01100001 (universe=public,
+                // type=individual, instance=desktop). A Steam Link guest with NO Steam account joins
+                // with SteamID 0 and is identified ONLY by its {guest, group}.
+                bool individual = ((v >> 32) == 0x01100001UL) && (uint)v != 0;
 
+                // Accept ONLY:
+                //   - realPlayer: a real desktop account, but only when it's CONFIRMED in our group
+                //     (structShape) or is the friend we explicitly invited (_target). The callback
+                //     payload also carries stray individual SteamIDs that are NOT current players
+                //     (groupMatch=False); accepting those made a bogus duplicate "Player N" row that
+                //     cross-wrote control. Requiring in-group confirmation drops them.
+                //   - anonGuest: a SteamID-0 guest whose guest id is one we actually handed out. The
+                //     guest-id bound drops the non-player structs that sit next to {group, guest=32/43}
+                //     (some SteamID 0, some garbage 64-bit doubles) that would otherwise flood the roster.
+                bool realPlayer = individual && (structShape || v == _target);
+                bool anonGuest = (v == 0) && structShape && guestCand >= 1 && guestCand <= _maxInvitedGuest;
+                if (!realPlayer && !anonGuest) continue;
+
+                // One-time diagnostic per distinct SteamID-shaped value: shows exactly what's in the
+                // payload (offset, adjacent guest/group, whether it's the host) — key for the link path.
+                if (_diagSeen.Add(v))
+                    if (_diag) Console.WriteLine("DIAG candidate steam=" + v + " off=" + off + " guest=" + guestCand + " grp=" + grpCand + " liveGroup=" + curGroup + " host=" + (v == _hostSteam) + " match=" + structShape);
+
+                if (v != 0 && v == _hostSteam) continue;   // never list the host themselves (has a real id)
+
+                // Real accounts are unique by SteamID; anonymous (steam==0) guests are unique by guest id.
                 GPlayer existing = null;
-                lock (_players) { foreach (GPlayer pp in _players) if (pp.Steam == v) { existing = pp; break; } }
+                lock (_players)
+                {
+                    foreach (GPlayer pp in _players)
+                        if (v != 0 ? pp.Steam == v : (pp.Steam == 0 && pp.Guest == guestCand)) { existing = pp; break; }
+                }
                 if (existing != null)
                 {
                     // Learn/upgrade a guest id we didn't have yet, then re-assert control on the right slot.
                     if (structShape && existing.Guest != guestCand)
                     {
                         existing.Guest = guestCand;
-                        _grantLogged = false; ApplyControl();
+                        if (_diag) Console.WriteLine("DIAG resolved guest id for " + existing.Name + " = " + guestCand + " (group " + grpCand + ")");
+                        _grantLogged = false; ApplyControl("guest id learned");
                     }
                     continue;
                 }
 
                 GPlayer np = new GPlayer(); np.Steam = v; np.Guest = structShape ? guestCand : 0; np.Name = LookupName(v);
                 int slot; lock (_players) { _players.Add(np); slot = _players.Count; }
-                if (string.IsNullOrEmpty(np.Name)) np.Name = "Player " + slot;
-                if (_target == 0) { _target = v; _grantLogged = false; }
+                if (string.IsNullOrEmpty(np.Name)) np.Name = (v == 0 ? "Steam Link guest " : "Player ") + slot;
+                if (_target == 0 && v != 0) { _target = v; }
+                _grantLogged = false;
                 Console.WriteLine("PLAYER JOINED " + np.Name);
+                if (_diag) Console.WriteLine("DIAG new player slot=" + slot + " steam=" + v + " guest=" + (structShape ? guestCand.ToString() : "?") + " groupMatch=" + structShape);
                 EmitPlayer(slot);
-                ApplyControl();
+                ApplyControl("new player " + slot);
+            }
+
+            // Group-anchored diagnostic: a no-account Steam Link guest may sit in a RemotePlayPlayer_t
+            // whose SteamID field is 0 or a non-individual value, so the SteamID-first scan above misses
+            // them. Locate the struct by its group anchor instead (groupId == our live group + a plausible
+            // guest id) and dump the raw layout so the guest's real id field is visible from the log. This
+            // is read-only and never used to grant control — purely to diagnose the missing-roster report.
+            if (_diag && curGroup != 0)
+            {
+                for (int off = 0; off + 16 <= 512; off += 4)
+                {
+                    uint grp;
+                    try { grp = (uint)Marshal.ReadInt32(param, off + 12); } catch { break; }
+                    if (grp != curGroup) continue;
+                    ulong sid; uint gid;
+                    try { sid = (ulong)Marshal.ReadInt64(param, off); gid = (uint)Marshal.ReadInt32(param, off + 8); } catch { continue; }
+                    if (gid < 1 || gid > 64) continue;
+                    // Only dump slots that are plausibly players (SteamID 0 or a real individual id);
+                    // skip the garbage 64-bit values (doubles) that share the {group, guest=32} shape,
+                    // otherwise desktop-streaming sessions spam dozens of grpslot lines.
+                    if (sid != 0 && (sid >> 32) != 0x01100001UL) continue;
+                    string key = off + ":" + sid + ":" + gid;
+                    if (_diag && _grpDiagSeen.Add(key))
+                        Console.WriteLine("DIAG grpslot off=" + off + " steam=" + sid + " guest=" + gid
+                            + " group=" + grp + " host=" + (sid == _hostSteam));
+                }
             }
         }
         catch { }
@@ -492,18 +672,21 @@ internal static class RPForgeSession
     }
 
     // Create one invite/session into the CURRENT group (a fresh guest id each time, so multiple guests
-    // coexist), pump for its join URL, and deliver it: link mode surfaces the URL (GUI copies it); friend
-    // mode also sends it to that friend in Steam chat. Runs on the main pump thread only.
+    // coexist), pump for its join URL, and deliver it: link mode just surfaces the URL (GUI copies it);
+    // friend mode sends it to that friend in Steam chat. Runs on the main pump thread only.
     [System.Runtime.ExceptionServices.HandleProcessCorruptedStateExceptions]
     [System.Security.SecurityCritical]
     static bool AddGuest(ulong target, bool link)
     {
         uint group = ReadGroup();
-        if (group == 0) return false;
+        if (group == 0) { Console.WriteLine("ADD failed — no active group yet."); return false; }
 
+        // fresh guest id in that group (each additional guest gets the next slot)
         uint guest = 0; int iG = R("GetAvailableRemotePlayTogetherGuestID");
         if (iG >= 0) { try { guest = V<D_Uu>(_rcm, iG)(_rcm, group); } catch { } }
         if (guest == 0) guest = 1;
+        if (guest > _maxInvitedGuest) _maxInvitedGuest = guest;   // bounds which guest ids we'll accept
+        Console.WriteLine("guest id = " + guest);
 
         IntPtr player = Marshal.AllocHGlobal(40);
         Marshal.WriteInt64(player, 0, (long)target);
@@ -513,27 +696,47 @@ internal static class RPForgeSession
         bool created = false;
         try { created = V<D_CreateInvite>(_rcm, R("BCreateRemotePlayInviteAndSession"))(_rcm, player, _appId); } catch { }
         Marshal.FreeHGlobal(player);
-        Console.WriteLine("BCreateRemotePlayInviteAndSession=" + created);
+        Console.WriteLine("BCreateRemotePlayInviteAndSession=" + created + " (group=" + group + " guest=" + guest + " app=" + _appId + ")");
 
-        string url = PumpForUrl(8000);
+        string url = NormalizeUrl(PumpForUrl(8000));
         if (url != null) Console.WriteLine((link ? "GUEST LINK = " : "JOIN URL = ") + url);
+        else Console.WriteLine("No join URL arrived (session may still work).");
 
         if (link)
         {
-            if (url != null) { try { SetClipboard(url); } catch { } }
+            if (url != null) { try { SetClipboard(url); Console.WriteLine("(link copied to clipboard)"); } catch { } }
         }
         else
         {
             EnsureFriends();   // safe now — the group already exists
+            string tname = null;
+            try { if (_cf != IntPtr.Zero) tname = Marshal.PtrToStringAnsi(V<D_NameOfId>(_cf, F("GetFriendPersonaName"))(_cf, target)); } catch { }
+            if (!string.IsNullOrEmpty(tname)) Console.WriteLine("friend = " + tname);
             if (url != null && _cf != IntPtr.Zero)
             {
                 bool sent = false;
                 try { int i = F("SendMsgToFriend"); if (i >= 0) sent = V<D_SendMsg>(_cf, i)(_cf, target, k_EChatEntryTypeChatMsg, "Join my Remote Play Together game: " + url); } catch { }
-                if (!sent) { try { int i = F("ReplyToFriendMessage"); if (i >= 0) V<D_Reply>(_cf, i)(_cf, target, "Join my Remote Play Together game: " + url); } catch { } }
-                try { SetClipboard(url); } catch { }
+                if (!sent) { try { int i = F("ReplyToFriendMessage"); if (i >= 0) sent = V<D_Reply>(_cf, i)(_cf, target, "Join my Remote Play Together game: " + url); } catch { } }
+                Console.WriteLine(sent ? "Sent the link to " + (tname ?? "your friend") + " in Steam chat." : "Could not auto-send; give them the URL above manually.");
+                try { SetClipboard(url); Console.WriteLine("(URL copied to clipboard)"); } catch { }
             }
         }
         return created;
+    }
+
+    // Steam sometimes returns the guest join URL without a scheme (e.g. "s.team/p/xxxx-xxxx"),
+    // which isn't clickable when pasted into Discord/Steam chat. Prepend https:// unless the URL
+    // already carries a scheme (http/https or the steam:// protocol) so the shared link always works.
+    static string NormalizeUrl(string u)
+    {
+        if (string.IsNullOrEmpty(u)) return u;
+        u = u.Trim();
+        if (u.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+            || u.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+            || u.StartsWith("steam://", StringComparison.OrdinalIgnoreCase))
+            return u;
+        if (u.StartsWith("//")) return "https:" + u;   // protocol-relative
+        return "https://" + u;
     }
 
     // Pump the callback pipe until a RemotePlayInviteResult (join URL) arrives or the timeout elapses.
@@ -563,7 +766,7 @@ internal static class RPForgeSession
         return url;
     }
 
-    static void Hold() { try { Console.ReadLine(); } catch { } }
+    static void Hold() { Console.WriteLine("\nPress Enter to close..."); try { Console.ReadLine(); } catch { } }
 
     static void SetClipboard(string s)
     {
@@ -577,8 +780,6 @@ internal static class RPForgeSession
         catch { }
     }
 
-    // Read the method name embedded in each vtable stub (a telemetry string referenced via `lea rip`),
-    // building a name -> index map so calls resolve by name and self-adapt to any Steam build.
     static Dictionary<string, int> ScanNames(IntPtr obj)
     {
         var map = new Dictionary<string, int>();

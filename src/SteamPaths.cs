@@ -47,17 +47,129 @@ namespace RemotePlayForge
         // The AppID of the game Steam currently considers "running" (0 if none).
         public static uint GetRunningAppId()
         {
+            uint reg = 0;
             try
             {
                 object v = Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam", "RunningAppID", null);
-                if (v != null)
+                if (v != null) uint.TryParse(v.ToString(), out reg);
+            }
+            catch { }
+
+            // Trust RunningAppID only when it names an actually-installed Steam app. Some titles launch
+            // through an external launcher and register a WRAPPER AppID that isn't in any library — e.g.
+            // EA FC 26 sets RunningAppID to 1182480, whose app name is literally "EALink" and which has
+            // no appmanifest. That id shows as "AppID <n>" and makes Remote Play Together label the
+            // session as the launcher, not the game. When it isn't installed, detect the real game.
+            if (reg != 0 && IsInstalledApp(reg)) return reg;
+
+            uint fb = DetectRunningGameFallback();
+            return fb != 0 ? fb : reg; // nothing better resolved; keep whatever the registry had
+        }
+
+        static uint _fbCache;
+        static readonly Stopwatch _fbAge = Stopwatch.StartNew();
+        static bool _fbPrimed;
+
+        // Resolve the real running game when RunningAppID is missing or a launcher wrapper. Cached ~4s
+        // because the status timer polls every ~1.5s. Tries the cheap, anti-cheat-proof registry signal
+        // first, then a process scan as a last resort.
+        static uint DetectRunningGameFallback()
+        {
+            if (_fbPrimed && _fbAge.ElapsedMilliseconds < 4000) return _fbCache;
+            uint id = DetectRunningAppViaSteamRegistry();
+            if (id == 0) id = DetectRunningSteamGameByProcess();
+            _fbCache = id; _fbPrimed = true; _fbAge.Restart();
+            return id;
+        }
+
+        // Even when RunningAppID is a launcher wrapper (e.g. EALink for EA FC 26), Steam still marks the
+        // REAL game as running under HKCU\...\Steam\Apps\<appid>\Running = 1. Reading that is cheap and
+        // works for anti-cheat-protected games whose process module path can't be read.
+        static uint DetectRunningAppViaSteamRegistry()
+        {
+            try
+            {
+                using (var apps = Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam\Apps"))
                 {
-                    uint id;
-                    if (uint.TryParse(v.ToString(), out id)) return id;
+                    if (apps == null) return 0;
+                    foreach (string name in apps.GetSubKeyNames())
+                    {
+                        uint id;
+                        if (!uint.TryParse(name, out id) || id == 0) continue;
+                        using (var k = apps.OpenSubKey(name))
+                        {
+                            if (k == null) continue;
+                            object run = k.GetValue("Running");
+                            if (run != null && Convert.ToInt32(run) == 1 && IsInstalledApp(id))
+                                return id;
+                        }
+                    }
                 }
             }
             catch { }
             return 0;
+        }
+
+        // True if this AppID has an appmanifest in any Steam library (i.e. it's a real installed game,
+        // not an external-launcher wrapper id).
+        static bool IsInstalledApp(uint appId)
+        {
+            if (appId == 0) return false;
+            try
+            {
+                foreach (string apps in GetSteamAppsFolders())
+                    if (File.Exists(Path.Combine(apps, "appmanifest_" + appId + ".acf")))
+                        return true;
+            }
+            catch { }
+            return false;
+        }
+
+        static uint _procScanCache;
+        static readonly Stopwatch _procScanAge = Stopwatch.StartNew();
+        static bool _procScanPrimed;
+
+        // Scan running processes for one whose executable sits inside a Steam library and resolve its
+        // AppID from the appmanifest. Cached briefly because the status timer polls every ~1.5s and a
+        // full process sweep is comparatively expensive.
+        static uint DetectRunningSteamGameByProcess()
+        {
+            if (_procScanPrimed && _procScanAge.ElapsedMilliseconds < 4000)
+                return _procScanCache;
+
+            uint best = 0;
+            try
+            {
+                foreach (Process p in Process.GetProcesses())
+                {
+                    string exe = null;
+                    bool hasWindow = false;
+                    try
+                    {
+                        if (p.MainModule != null) exe = p.MainModule.FileName;
+                        hasWindow = p.MainWindowHandle != IntPtr.Zero;
+                    }
+                    catch { continue; }   // access denied / bitness mismatch — skip this process
+                    finally { try { p.Dispose(); } catch { } }
+
+                    if (string.IsNullOrEmpty(exe)) continue;
+                    if (exe.IndexOf(@"\steamapps\common\", StringComparison.OrdinalIgnoreCase) < 0) continue;
+
+                    string idStr = TryResolveSteamAppId(exe);
+                    uint id;
+                    if (idStr != null && uint.TryParse(idStr, out id) && id != 0)
+                    {
+                        if (hasWindow) { best = id; break; }   // the windowed process is the game itself
+                        if (best == 0) best = id;              // else remember the first match
+                    }
+                }
+            }
+            catch { }
+
+            _procScanCache = best;
+            _procScanPrimed = true;
+            _procScanAge.Restart();
+            return best;
         }
 
         // Human-readable name of an installed AppID (from its appmanifest "name"), searching every
