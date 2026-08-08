@@ -54,7 +54,8 @@ internal static class RPForgeSession
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void D_Free(int pipe);
 
     static IntPtr _rcm, _cf, _h;
-    static IntPtr _eng; static int _user; static uint _appId;
+    static IntPtr _eng; static int _user; static uint _appId, _inviteAppId;
+    static bool _desktopStreaming;
     static ulong _target;
     static int _pipe;
     static Dictionary<string, int> _rmap, _fmap;
@@ -100,6 +101,24 @@ internal static class RPForgeSession
         return @"C:\Program Files (x86)\Steam";
     }
 
+    // REG_DWORD is surfaced as a signed Int32 by Registry.GetValue. Non-Steam shortcut AppIDs have
+    // bit 31 set, so preserve the DWORD's raw bits instead of using Convert.ToUInt32 (which throws).
+    static uint ReadRegistryUInt32(string keyName, string valueName)
+    {
+        try
+        {
+            object value = Microsoft.Win32.Registry.GetValue(keyName, valueName, null);
+            if (value is int) return unchecked((uint)(int)value);
+            if (value is uint) return (uint)value;
+            uint parsed;
+            if (value != null && uint.TryParse(value.ToString(), out parsed)) return parsed;
+            int signed;
+            if (value != null && int.TryParse(value.ToString(), out signed)) return unchecked((uint)signed);
+        }
+        catch { }
+        return 0;
+    }
+
     // NOTE: Main is intentionally MTA (no [STAThread]). Steam's async RPT group creation does not
     // complete when the calling thread is STA — verified: STA => group stays 0, MTA => group allocates.
     static int Main(string[] args)
@@ -129,29 +148,44 @@ internal static class RPForgeSession
         // AppID: prefer an explicit arg2 (the GUI passes its resolved AppID); else read the registry.
         uint appId = 0;
         if (args.Length > 1) uint.TryParse(args[1], out appId);
-        if (appId == 0) { try { object v = Microsoft.Win32.Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam", "RunningAppID", 0); if (v != null) appId = Convert.ToUInt32(v); } catch { } }
+        if (appId == 0) appId = ReadRegistryUInt32(@"HKEY_CURRENT_USER\Software\Valve\Steam", "RunningAppID");
         Console.WriteLine("AppID = " + appId);
         _appId = appId;
         // Our own SteamID64 = individual base + the logged-in account id (from the registry). Used to
         // exclude the host when scanning callbacks for guest SteamIDs (both have the 0x01100001 signature).
-        try { object av = Microsoft.Win32.Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam\ActiveProcess", "ActiveUser", 0); if (av != null) { uint acct = Convert.ToUInt32(av); if (acct != 0) _hostSteam = 76561197960265728UL + acct; } } catch { }
+        try { uint acct = ReadRegistryUInt32(@"HKEY_CURRENT_USER\Software\Valve\Steam\ActiveProcess", "ActiveUser"); if (acct != 0) _hostSteam = 76561197960265728UL + acct; } catch { }
         if (appId == 0) { Console.WriteLine("No game running under Steam. Launch your game first, then rerun."); Hold(); return 4; }
 
-        // If Steam isn't tracking this AppID as its running game, the game was launched OUTSIDE Steam —
-        // e.g. EA FC 26 through the EA App. Steam then has no game window hooked to capture, so enable
-        // DESKTOP streaming (share the whole screen), which works regardless of how the game launched.
-        // For a normally-launched Steam game the ids match and we leave the default game-window capture.
-        uint steamTracked = 0;
-        try { object rv = Microsoft.Win32.Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam", "RunningAppID", 0); if (rv != null) steamTracked = Convert.ToUInt32(rv); } catch { }
-        if (appId != steamTracked)
+        // Steam's game-window capture works for native apps. Non-Steam shortcuts (high-bit AppIDs) and
+        // games launched outside Steam need DESKTOP streaming, otherwise guests can join but remain on
+        // the loading screen with input disabled because no capturable game target is bound.
+        uint steamTracked = ReadRegistryUInt32(@"HKEY_CURRENT_USER\Software\Valve\Steam", "RunningAppID");
+        bool nonSteamShortcut = (appId & 0x80000000U) != 0;
+        bool launchedOutsideSteam = appId != steamTracked;
+        _desktopStreaming = nonSteamShortcut || launchedOutsideSteam;
+
+        // Steam identifies a non-Steam shortcut with a high-bit AppID, but its desktop-stream
+        // invite is created against AppID 0. Keep the shortcut AppID for the overlay, group
+        // publication and controller profile; only the invite/session uses the desktop AppID.
+        _inviteAppId = nonSteamShortcut ? 0U : appId;
+        if (nonSteamShortcut)
+            Console.WriteLine("Non-Steam desktop invite AppID = 0; shortcut AppID remains " + appId + ".");
+
+        if (_desktopStreaming)
         {
             int iDesk = R("SetStreamingDesktopToRemotePlayTogetherEnabled");
             if (iDesk >= 0)
             {
-                try { V<D_VoidB>(_rcm, iDesk)(_rcm, true); Console.WriteLine("Enabled desktop streaming (AppID " + appId + " launched outside Steam)."); }
+                try
+                {
+                    V<D_VoidB>(_rcm, iDesk)(_rcm, true);
+                    Console.WriteLine("Enabled desktop streaming (" +
+                        (nonSteamShortcut ? "non-Steam shortcut" : "game launched outside Steam") +
+                        ", AppID " + appId + ").");
+                }
                 catch (Exception e) { Console.WriteLine("  desktop-stream enable threw " + e.GetType().Name); }
             }
-            else if (_diag) Console.WriteLine("DIAG SetStreamingDesktopToRemotePlayTogetherEnabled not found in RCM.");
+            else Console.WriteLine("Desktop streaming method was not found in this Steam client build.");
         }
 
         // resolve target: a friend SteamID64 (direct invite) OR "LINK"/0 for a shareable guest link
@@ -681,6 +715,18 @@ internal static class RPForgeSession
         uint group = ReadGroup();
         if (group == 0) { Console.WriteLine("ADD failed — no active group yet."); return false; }
 
+        // Reassert desktop capture immediately before every invite. Steam may clear this state
+        // while a non-Steam launcher exits and hands off to the real game process.
+        if (_desktopStreaming)
+        {
+            int iDesk = R("SetStreamingDesktopToRemotePlayTogetherEnabled");
+            if (iDesk >= 0)
+            {
+                try { V<D_VoidB>(_rcm, iDesk)(_rcm, true); }
+                catch (Exception ex) { Console.WriteLine("Could not reassert desktop streaming: " + ex.Message); }
+            }
+        }
+
         // fresh guest id in that group (each additional guest gets the next slot)
         uint guest = 0; int iG = R("GetAvailableRemotePlayTogetherGuestID");
         if (iG >= 0) { try { guest = V<D_Uu>(_rcm, iG)(_rcm, group); } catch { } }
@@ -694,9 +740,10 @@ internal static class RPForgeSession
         Marshal.WriteInt32(player, 12, (int)group);
         Marshal.WriteInt64(player, 16, 0); Marshal.WriteInt64(player, 24, 0); Marshal.WriteInt32(player, 32, 0); Marshal.WriteInt32(player, 36, 0);
         bool created = false;
-        try { created = V<D_CreateInvite>(_rcm, R("BCreateRemotePlayInviteAndSession"))(_rcm, player, _appId); } catch { }
+        try { created = V<D_CreateInvite>(_rcm, R("BCreateRemotePlayInviteAndSession"))(_rcm, player, _inviteAppId); } catch { }
         Marshal.FreeHGlobal(player);
-        Console.WriteLine("BCreateRemotePlayInviteAndSession=" + created + " (group=" + group + " guest=" + guest + " app=" + _appId + ")");
+        Console.WriteLine("BCreateRemotePlayInviteAndSession=" + created + " (group=" + group + " guest=" + guest +
+            " inviteApp=" + _inviteAppId + " gameApp=" + _appId + ")");
 
         string url = NormalizeUrl(PumpForUrl(8000));
         if (url != null) Console.WriteLine((link ? "GUEST LINK = " : "JOIN URL = ") + url);

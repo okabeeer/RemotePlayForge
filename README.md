@@ -14,6 +14,7 @@ Inspired by [RemotePlayWhatever](https://github.com/m4dEngi/RemotePlayWhatever).
 ## Features
 
 - **Invite an online friend** straight from an in-app list, or **generate a shareable guest link** that anyone with Steam can join — no friendship required.
+- **Native and non-Steam games** — detects both installed Steam titles and per-account non-Steam shortcuts, including high-bit shortcut AppIDs.
 - **Multiple guests at once** — invite several friends (or share one link with the group); everyone joins the same session and each appears in a live roster.
 - **Per-person control** — each connected guest gets their own row with keyboard / mouse / controller toggles. Give or revoke any peripheral for any individual, live, mid-game.
 - **"Everyone" controls** — pause or hand back control to all guests at once.
@@ -56,7 +57,7 @@ This compiles the GUI (`src/*.cs`) and the session helper (`helper/RPForgeSessio
 
 ## Run
 
-1. Launch the game you want to play **through Steam**.
+1. Launch the game you want to play **through Steam** (either a native title or a game added as a non-Steam shortcut).
 2. Run `bin/RemotePlayForge.exe`.
 3. Either pick an online friend and click **Invite & Give Control**, or click **Generate guest link**
    and share the copied link with your friends.
